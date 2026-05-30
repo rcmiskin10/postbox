@@ -21,13 +21,22 @@
     "test:watch": "vitest",
     "postbox": "node bin/postbox.mjs"
   },
-  "keywords": ["orchestration", "handoff", "mailbox", "multi-agent", "maildir", "message-bus", "claude-code"],
+  "keywords": [
+    "orchestration",
+    "handoff",
+    "mailbox",
+    "multi-agent",
+    "maildir",
+    "message-bus",
+    "claude-code"
+  ],
   "license": "MIT",
   "author": "Ricky Miskin",
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
+    "smol-toml": "^1.6.1",
     "yaml": "^2.5.0"
   },
   "devDependencies": {
