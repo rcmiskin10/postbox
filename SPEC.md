@@ -11,7 +11,7 @@ axis_identity: uuidv7-envelope-id      # ④ every envelope has a uuidv7 id = id
 axis_envelope: eventenvelope-projection # ⑤ frontmatter is a projection of the north-star EventEnvelope
 status: draft
 date: 2026-05-30
-adr: ../_decisions/0016-session-handoff-postbox-cli-plugin.md  # (workspace-relative; informative)
+adr: ../_decisions/0017-session-handoff-postbox-cli-plugin.md  # (workspace-relative; informative)
 ---
 
 # postbox — specification

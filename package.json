@@ -1,0 +1,36 @@
+{
+  "name": "postbox",
+  "version": "0.0.1",
+  "description": "A mailbox for agent sessions: race-free, server-free task handoff via the Maildir atomic-rename pattern.",
+  "type": "module",
+  "bin": {
+    "postbox": "bin/postbox.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "SPEC.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postbox": "node bin/postbox.mjs"
+  },
+  "keywords": ["orchestration", "handoff", "mailbox", "multi-agent", "maildir", "message-bus", "claude-code"],
+  "license": "MIT",
+  "author": "Ricky Miskin",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.0"
+  }
+}
