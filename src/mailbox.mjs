@@ -1,8 +1,10 @@
 import {
   mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, fsyncSync, openSync, closeSync,
+  existsSync,
 } from 'node:fs';
 import { join, basename } from 'node:path';
 import { createEnvelope, serializeEnvelope, parseEnvelope } from './envelope.mjs';
+import { matchesTarget } from './target-match.mjs';
 
 /** The four authoritative states (status-in-path). `.processed/` and `.tmp/` are bookkeeping. */
 export const STATES = ['ready', 'claimed', 'done', 'dead'];
@@ -29,6 +31,44 @@ export class Mailbox {
   /** List the `.md` filenames in a state dir. */
   list(state) {
     return readdirSync(join(this.dir, state)).filter((f) => f.endsWith('.md'));
+  }
+
+  /** Parse a claimed/ filename `<uuid>.<session>.<leaseMs>.md` → its parts, or null. */
+  _parseClaim(file) {
+    const m = file.match(/^([0-9a-f-]{36})\.(.+)\.(\d+)\.md$/);
+    return m ? { id: m[1], session: m[2], leaseMs: Number(m[3]), file } : null;
+  }
+
+  /** Read + parse an envelope from a state dir. */
+  _read(state, file) {
+    return parseEnvelope(readFileSync(join(this.dir, state, file), 'utf8'));
+  }
+
+  /** Mark an envelope surfaced-to a session (idempotency sentinel, SPEC §7). */
+  markProcessed(session, id) {
+    mkdirSync(join(this.dir, '.processed', session), { recursive: true });
+    writeFileSync(join(this.dir, '.processed', session, id), '');
+  }
+
+  isProcessed(session, id) {
+    return existsSync(join(this.dir, '.processed', session, id));
+  }
+
+  /**
+   * List what a session should see: ready/ envelopes addressed to `consumer`, plus done/
+   * envelopes for the writer (`asSource`). Opportunistically sweeps expired leases first
+   * (SPEC §6/§9). `unprocessedFor` hides envelopes already surfaced to that session.
+   */
+  inbox({ consumer = null, asSource = null, unprocessedFor = null, now = Date.now(), sweep = true } = {}) {
+    if (sweep) this.sweep({ now });
+    const fresh = (e) => !unprocessedFor || !this.isProcessed(unprocessedFor, e.id);
+    const ready = consumer
+      ? this.list('ready').map((f) => this._read('ready', f)).filter((e) => matchesTarget(e.target, consumer)).filter(fresh)
+      : [];
+    const done = asSource
+      ? this.list('done').map((f) => this._read('done', f)).filter((e) => e.source_role === asSource).filter(fresh)
+      : [];
+    return { ready, done };
   }
 
   /**
@@ -91,5 +131,66 @@ export class Mailbox {
     ];
     this._rewrite(dst, env);
     return { ok: true, id, session, leaseExpMs, path: dst };
+  }
+
+  /**
+   * Report an outcome on a claim this session owns: append a `## Outcome` block + a
+   * status_history record (never overwriting the body), then CAS rename claimed/ → done/.
+   * @returns {{ok:true,id,path,outcome_ref}|{ok:false,reason:'lease-not-owned',id}}
+   */
+  report(id, { session, outcome = null, now = Date.now() } = {}) {
+    if (!session) throw new Error('postbox: report requires a session');
+    const claimedDir = join(this.dir, 'claimed');
+    const file = readdirSync(claimedDir)
+      .map((f) => this._parseClaim(f))
+      .find((c) => c && c.id === id && c.session === session)?.file;
+    if (!file) return { ok: false, reason: 'lease-not-owned', id };
+
+    const src = join(claimedDir, file);
+    const dst = this._state('done', `${id}.md`);
+    const env = parseEnvelope(readFileSync(src, 'utf8'));
+    env.status = 'done';
+    env.outcome_ref = outcome;
+    env.status_history = [
+      ...(env.status_history ?? []),
+      { at: new Date(now).toISOString(), from: 'claimed', to: 'done', by: session, outcome_ref: outcome },
+    ];
+    env.body = `${env.body.replace(/\s+$/, '')}\n\n## Outcome\n\n${outcome ?? '(none)'}\n`;
+    this._rewrite(src, env); // we own this file; safe in-place update
+    renameSync(src, dst);
+    return { ok: true, id, path: dst, outcome_ref: outcome };
+  }
+
+  /**
+   * Reclaim every claimed/ envelope whose lease has expired back to ready/. The reclaim is
+   * itself a CAS rename (two sweepers race → one wins, the other gets ENOENT). No timer,
+   * no daemon — callers run this opportunistically (SPEC §6).
+   * @returns {{reclaimed:string[]}} ids moved back to ready/
+   */
+  sweep({ now = Date.now() } = {}) {
+    const claimedDir = join(this.dir, 'claimed');
+    const reclaimed = [];
+    for (const f of readdirSync(claimedDir)) {
+      const c = this._parseClaim(f);
+      if (!c || c.leaseMs >= now) continue;
+      const src = join(claimedDir, f);
+      const dst = this._state('ready', `${c.id}.md`);
+      try {
+        renameSync(src, dst); // CAS — loser sweeper gets ENOENT
+      } catch (e) {
+        if (e.code === 'ENOENT') continue;
+        throw e;
+      }
+      const env = parseEnvelope(readFileSync(dst, 'utf8'));
+      env.status = 'ready';
+      env.lease_exp = null;
+      env.status_history = [
+        ...(env.status_history ?? []),
+        { at: new Date(now).toISOString(), from: 'claimed', to: 'ready', by: c.session, reason: 'lease-expired' },
+      ];
+      this._rewrite(dst, env);
+      reclaimed.push(c.id);
+    }
+    return { reclaimed };
   }
 }
