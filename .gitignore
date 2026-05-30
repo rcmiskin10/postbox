@@ -1,0 +1,12 @@
+# dependencies
+node_modules/
+# build output
+dist/
+*.tsbuildinfo
+# runtime mailbox state (never commit a live mailbox)
+**/.processed/
+# os / editor
+.DS_Store
+*.log
+# local config
+.postbox.local.toml
