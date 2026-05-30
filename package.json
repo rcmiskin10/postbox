@@ -1,6 +1,6 @@
 {
   "name": "postbox",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "A mailbox for agent sessions: race-free, server-free task handoff via the Maildir atomic-rename pattern.",
   "type": "module",
   "bin": {

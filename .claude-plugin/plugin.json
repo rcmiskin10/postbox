@@ -1,8 +1,17 @@
 {
   "name": "postbox",
   "description": "A mailbox for agent sessions: race-free, server-free task handoff between Claude Code sessions via the Maildir atomic-rename pattern. Sends, claims, and reports flow through Markdown envelope files; results return on their own.",
-  "version": "0.0.1",
-  "author": { "name": "Ricky Miskin" },
+  "version": "0.1.0",
+  "author": {
+    "name": "Ricky Miskin"
+  },
   "license": "MIT",
-  "keywords": ["orchestration", "handoff", "mailbox", "multi-agent", "maildir", "message-bus"]
+  "keywords": [
+    "orchestration",
+    "handoff",
+    "mailbox",
+    "multi-agent",
+    "maildir",
+    "message-bus"
+  ]
 }
