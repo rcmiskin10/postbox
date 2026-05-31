@@ -2,10 +2,12 @@
 // postbox CLI — thin shell over the Mailbox state machine (SPEC §12).
 // All correctness (CAS-on-source, leases, return channel) lives in src/; this file only
 // parses args, picks a command, and maps results to stable exit codes.
-import { writeFileSync, renameSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, renameSync, rmSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { Mailbox } from '../src/mailbox.mjs';
 import { loadConfig } from '../src/config.mjs';
+import { parseEnvelope, serializeEnvelope } from '../src/envelope.mjs';
+import { migrateLegacyBrief } from '../src/migrate.mjs';
 
 const EXIT = { OK: 0, USAGE: 2, ALREADY_CLAIMED: 3, LEASE_NOT_OWNED: 4, UNSAFE_FS: 5 };
 
@@ -94,8 +96,10 @@ function main() {
       return doctor(dir);
     case 'init':
       return init();
+    case 'migrate':
+      return migrate(flags);
     default:
-      fail(`unknown command '${cmd ?? ''}'. Try: send | inbox | claim | report | sweep | doctor | init`, EXIT.USAGE);
+      fail(`unknown command '${cmd ?? ''}'. Try: send | inbox | claim | report | sweep | doctor | init | migrate`, EXIT.USAGE);
   }
 }
 
@@ -152,6 +156,46 @@ identities   = []                # addresses this session answers to, e.g. ["pro
     '\nWire the write-boundary yourself (postbox cannot self-enforce) — add to .claude/settings.json:\n' +
     '  "permissions": { "ask": ["Write(<other-session-dir>/**)", "Edit(<other-session-dir>/**)"] }\n',
   );
+  return EXIT.OK;
+}
+
+function tally(rows, key) {
+  const m = {};
+  for (const r of rows) m[r[key]] = (m[r[key]] ?? 0) + 1;
+  return m;
+}
+
+// Migrate a legacy flat _briefs/ dir onto the postbox schema. Dry-run by default; --apply
+// writes envelopes into <to>/{ready,done}/. Reversible: never deletes the source.
+function migrate(flags) {
+  const from = flags.from ? String(flags.from) : null;
+  if (!from) fail('migrate requires --from <legacy-briefs-dir>', EXIT.USAGE);
+  const files = readdirSync(from).filter((f) => f.endsWith('.md'));
+  const rows = [];
+  for (const f of files) {
+    let parsed;
+    try { parsed = parseEnvelope(readFileSync(join(from, f), 'utf8')); }
+    catch { rows.push({ file: f, skipped: 'no-frontmatter' }); continue; }
+    const env = migrateLegacyBrief(parsed);
+    rows.push({ file: f, id: env.id, target: env.target, status: env.status, _env: env });
+  }
+  const ok = rows.filter((r) => r.id);
+  const summary = {
+    from,
+    total: files.length,
+    migratable: ok.length,
+    skipped: rows.filter((r) => r.skipped).length,
+    byStatus: tally(ok, 'status'),
+    byTarget: tally(ok, 'target'),
+  };
+  if (!flags.apply) {
+    out({ dryRun: true, ...summary, sample: ok.slice(0, 8).map(({ file, target, status }) => ({ file, target, status })) });
+    return EXIT.OK;
+  }
+  const to = flags.to ? String(flags.to) : from;
+  new Mailbox({ dir: to }); // ensure ready/ done/ dirs exist
+  for (const r of ok) writeFileSync(join(to, r._env.status, `${r._env.id}.md`), serializeEnvelope(r._env));
+  out({ applied: true, ...summary, to });
   return EXIT.OK;
 }
 
