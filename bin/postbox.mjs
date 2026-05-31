@@ -95,7 +95,7 @@ function main() {
     case 'doctor':
       return doctor(dir);
     case 'init':
-      return init();
+      return init(flags);
     case 'migrate':
       return migrate(flags);
     default:
@@ -137,14 +137,23 @@ function doctor(dir) {
   return EXIT.OK;
 }
 
-function init() {
+// Scaffold a .postbox.toml + print the settings.json snippets a session needs to join a
+// mailbox. --identity (comma-sep) + --mailbox (handoff_dir, relative to this dir) + --match
+// let one command wire a consumer; bare `init` writes the source-side defaults.
+function init(flags = {}) {
   const path = join(process.cwd(), '.postbox.toml');
+  const mailbox = flags.mailbox ? String(flags.mailbox) : '_briefs';
+  const match = flags.match ? String(flags.match) : 'role';
+  const identities = flags.identity
+    ? String(flags.identity).split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
+  const idLine = identities.length ? `[${identities.map((i) => `"${i}"`).join(', ')}]` : '[]';
   const toml = `# .postbox.toml — all keys optional (SPEC §10)
-handoff_dir  = "_briefs"
+handoff_dir  = "${mailbox}"
 tenant_id    = "default"
 lease_ttl    = "60m"
-target_match = "role"            # role | explicit-list | cwd-glob
-identities   = []                # addresses this session answers to, e.g. ["product:foo"]
+target_match = "${match}"            # role | explicit-list | cwd-glob
+identities   = ${idLine}                # addresses this session answers to, e.g. ["product:foo"]
 `;
   if (existsSync(path)) {
     process.stderr.write(`postbox: ${path} already exists — left untouched.\n`);
@@ -155,6 +164,13 @@ identities   = []                # addresses this session answers to, e.g. ["pro
   process.stdout.write(
     '\nWire the write-boundary yourself (postbox cannot self-enforce) — add to .claude/settings.json:\n' +
     '  "permissions": { "ask": ["Write(<other-session-dir>/**)", "Edit(<other-session-dir>/**)"] }\n',
+  );
+  process.stdout.write(
+    '\nAuto-surface this session\'s inbox — add to .claude/settings.json "hooks" (pointer, not instruction):\n' +
+    '  "SessionStart": [{ "hooks": [{ "type": "command",\n' +
+    '    "command": "node \\"$CLAUDE_PROJECT_DIR/../../postbox/bin/postbox.mjs\\" inbox --format pointer 2>/dev/null || true" }] }]\n' +
+    'and allow the exec + read:\n' +
+    '  "permissions": { "allow": ["Bash(node:*)", "Read(' + (mailbox.startsWith('.') ? '<workspace>/_briefs' : mailbox) + '/**)"] }\n',
   );
   return EXIT.OK;
 }
