@@ -1,6 +1,6 @@
 import {
   mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, fsyncSync, openSync, closeSync,
-  existsSync,
+  existsSync, rmSync,
 } from 'node:fs';
 import { join, basename } from 'node:path';
 import { createEnvelope, serializeEnvelope, parseEnvelope } from './envelope.mjs';
@@ -39,9 +39,33 @@ export class Mailbox {
     return m ? { id: m[1], session: m[2], leaseMs: Number(m[3]), file } : null;
   }
 
+  /**
+   * A session name becomes a path segment in the claimed/ filename (`<id>.<session>.<ms>.md`),
+   * so a `/`, `\`, or NUL would escape the directory and make rename(2) throw ENOENT (read as a
+   * spurious "already-claimed"). Reject those up front with a clear error.
+   */
+  _validateSession(session) {
+    if (/[/\\\0]/.test(session)) {
+      throw new Error(`postbox: invalid session '${session}' — must not contain / \\ or NUL`);
+    }
+  }
+
   /** Read + parse an envelope from a state dir. */
   _read(state, file) {
     return parseEnvelope(readFileSync(join(this.dir, state, file), 'utf8'));
+  }
+
+  /**
+   * Read + parse an envelope, returning null instead of throwing on a corrupt/half-written/
+   * non-envelope `.md` file. Keeps one bad file from making the whole inbox unreadable.
+   */
+  _readSafe(state, file) {
+    try {
+      return this._read(state, file);
+    } catch (e) {
+      process.stderr.write(`postbox: skipping unreadable ${state}/${file} (${e.code ?? e.message})\n`);
+      return null;
+    }
   }
 
   /** Mark an envelope surfaced-to a session (idempotency sentinel, SPEC §7). */
@@ -63,10 +87,10 @@ export class Mailbox {
     if (sweep) this.sweep({ now });
     const fresh = (e) => !unprocessedFor || !this.isProcessed(unprocessedFor, e.id);
     const ready = consumer
-      ? this.list('ready').map((f) => this._read('ready', f)).filter((e) => matchesTarget(e.target, consumer)).filter(fresh)
+      ? this.list('ready').map((f) => this._readSafe('ready', f)).filter(Boolean).filter((e) => matchesTarget(e.target, consumer)).filter(fresh)
       : [];
     const done = asSource
-      ? this.list('done').map((f) => this._read('done', f)).filter((e) => e.source_role === asSource).filter(fresh)
+      ? this.list('done').map((f) => this._readSafe('done', f)).filter(Boolean).filter((e) => e.source_role === asSource).filter(fresh)
       : [];
     return { ready, done };
   }
@@ -91,7 +115,12 @@ export class Mailbox {
     return env;
   }
 
-  /** Atomically replace a file this process exclusively owns (tmp → fsync → rename). */
+  /**
+   * Atomically replace a file this process exclusively owns (tmp → fsync → rename). Guards
+   * against the rename(2) "create if missing" semantic: if a sweeper reclaimed `path` out from
+   * under us between our read and now, recreating it would ghost-resurrect a file in two states.
+   * We refuse and throw ENOENT so the caller can treat it as a lost race.
+   */
   _rewrite(path, env) {
     const tmp = join(this.dir, '.tmp', `${basename(path)}.tmp`);
     const fd = openSync(tmp, 'w');
@@ -100,6 +129,10 @@ export class Mailbox {
       fsyncSync(fd);
     } finally {
       closeSync(fd);
+    }
+    if (!existsSync(path)) {
+      rmSync(tmp, { force: true });
+      throw Object.assign(new Error(`postbox: ${path} vanished before rewrite`), { code: 'ENOENT' });
     }
     renameSync(tmp, path);
   }
@@ -112,6 +145,7 @@ export class Mailbox {
    */
   claim(id, { session, now = Date.now() } = {}) {
     if (!session) throw new Error('postbox: claim requires a session');
+    this._validateSession(session);
     const src = this._state('ready', `${id}.md`);
     const leaseExpMs = now + this.leaseTtlMs;
     const dst = this._state('claimed', `${id}.${session}.${leaseExpMs}.md`);
@@ -121,16 +155,26 @@ export class Mailbox {
       if (e.code === 'ENOENT') return { ok: false, reason: 'already-claimed', id };
       throw e;
     }
-    const env = parseEnvelope(readFileSync(dst, 'utf8'));
-    const leaseIso = new Date(leaseExpMs).toISOString();
-    env.status = 'claimed';
-    env.lease_exp = leaseIso;
-    env.status_history = [
-      ...(env.status_history ?? []),
-      { at: new Date(now).toISOString(), from: 'ready', to: 'claimed', by: session, lease_exp: leaseIso },
-    ];
-    this._rewrite(dst, env);
-    return { ok: true, id, session, leaseExpMs, path: dst };
+    // The CAS is already won — this session owns dst. The metadata rewrite below is a
+    // best-effort body update; if it fails (disk full, etc.) the claim still stands (the lease
+    // is encoded in the filename, which is authoritative), so report success with a warning
+    // rather than throwing and leaving the caller unsure whether they hold the lease.
+    const result = { ok: true, id, session, leaseExpMs, path: dst };
+    try {
+      const env = parseEnvelope(readFileSync(dst, 'utf8'));
+      const leaseIso = new Date(leaseExpMs).toISOString();
+      env.status = 'claimed';
+      env.lease_exp = leaseIso;
+      env.status_history = [
+        ...(env.status_history ?? []),
+        { at: new Date(now).toISOString(), from: 'ready', to: 'claimed', by: session, lease_exp: leaseIso },
+      ];
+      this._rewrite(dst, env);
+    } catch (e) {
+      result.warning = `claim won but metadata update failed: ${e.code ?? e.message}`;
+      process.stderr.write(`postbox: ${result.warning}\n`);
+    }
+    return result;
   }
 
   /**
@@ -140,6 +184,7 @@ export class Mailbox {
    */
   report(id, { session, outcome = null, now = Date.now() } = {}) {
     if (!session) throw new Error('postbox: report requires a session');
+    this._validateSession(session);
     const claimedDir = join(this.dir, 'claimed');
     const file = readdirSync(claimedDir)
       .map((f) => this._parseClaim(f))
@@ -148,7 +193,16 @@ export class Mailbox {
 
     const src = join(claimedDir, file);
     const dst = this._state('done', `${id}.md`);
-    const env = parseEnvelope(readFileSync(src, 'utf8'));
+    // A sweeper can reclaim our claimed/ file (lease expired) between the readdir scan above and
+    // the writes below. If so, src is gone: report a structured lease-expired result instead of
+    // crashing or ghost-recreating the file in two states. _rewrite already guards the rename.
+    let env;
+    try {
+      env = parseEnvelope(readFileSync(src, 'utf8'));
+    } catch (e) {
+      if (e.code === 'ENOENT') return { ok: false, reason: 'lease-expired', id };
+      throw e;
+    }
     env.status = 'done';
     env.outcome_ref = outcome;
     env.status_history = [
@@ -156,8 +210,13 @@ export class Mailbox {
       { at: new Date(now).toISOString(), from: 'claimed', to: 'done', by: session, outcome_ref: outcome },
     ];
     env.body = `${env.body.replace(/\s+$/, '')}\n\n## Outcome\n\n${outcome ?? '(none)'}\n`;
-    this._rewrite(src, env); // we own this file; safe in-place update
-    renameSync(src, dst);
+    try {
+      this._rewrite(src, env); // we own this file; safe in-place update (guards ENOENT)
+      renameSync(src, dst);
+    } catch (e) {
+      if (e.code === 'ENOENT') return { ok: false, reason: 'lease-expired', id };
+      throw e;
+    }
     return { ok: true, id, path: dst, outcome_ref: outcome };
   }
 
@@ -181,15 +240,25 @@ export class Mailbox {
         if (e.code === 'ENOENT') continue;
         throw e;
       }
-      const env = parseEnvelope(readFileSync(dst, 'utf8'));
-      env.status = 'ready';
-      env.lease_exp = null;
-      env.status_history = [
-        ...(env.status_history ?? []),
-        { at: new Date(now).toISOString(), from: 'claimed', to: 'ready', by: c.session, reason: 'lease-expired' },
-      ];
-      this._rewrite(dst, env);
+      // The file is back in ready/ and counts as reclaimed regardless of what happens next.
       reclaimed.push(c.id);
+      try {
+        const env = parseEnvelope(readFileSync(dst, 'utf8'));
+        env.status = 'ready';
+        env.lease_exp = null;
+        env.status_history = [
+          ...(env.status_history ?? []),
+          { at: new Date(now).toISOString(), from: 'claimed', to: 'ready', by: c.session, reason: 'lease-expired' },
+        ];
+        this._rewrite(dst, env);
+      } catch (e) {
+        // A concurrent claimer grabbed the just-reclaimed file (ENOENT), or it is corrupt. The
+        // reclaim itself stands (path is authoritative); only the bookkeeping rewrite is lost.
+        // Either way, don't let one file crash the whole sweep (which inbox() runs on every call).
+        if (e.code !== 'ENOENT') {
+          process.stderr.write(`postbox: sweep could not update ${c.id} after reclaim (${e.code ?? e.message})\n`);
+        }
+      }
     }
     return { reclaimed };
   }

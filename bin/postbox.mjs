@@ -7361,7 +7361,7 @@ var require_dist = __commonJS({
 });
 
 // src/cli.mjs
-import { writeFileSync as writeFileSync2, renameSync as renameSync2, rmSync, readFileSync as readFileSync3, existsSync as existsSync3, readdirSync as readdirSync2, mkdirSync as mkdirSync2 } from "node:fs";
+import { writeFileSync as writeFileSync2, renameSync as renameSync2, rmSync as rmSync2, readFileSync as readFileSync3, existsSync as existsSync3, readdirSync as readdirSync2, mkdirSync as mkdirSync2, openSync as openSync2, fsyncSync as fsyncSync2, closeSync as closeSync2 } from "node:fs";
 import { join as join3, relative, basename as basename2, dirname as dirname2, resolve as resolvePath } from "node:path";
 
 // src/mailbox.mjs
@@ -7374,7 +7374,8 @@ import {
   fsyncSync,
   openSync,
   closeSync,
-  existsSync
+  existsSync,
+  rmSync
 } from "node:fs";
 import { join, basename } from "node:path";
 
@@ -7383,8 +7384,18 @@ var import_yaml = __toESM(require_dist(), 1);
 
 // src/uuidv7.mjs
 import { randomBytes } from "node:crypto";
+var _lastMs = 0;
+var _seq = 0;
 function uuidv7() {
-  const ts = Date.now();
+  let ts = Date.now();
+  if (ts > _lastMs) {
+    _lastMs = ts;
+    _seq = randomBytes(2).readUInt16BE(0) & 4095;
+  } else {
+    _seq = _seq + 1 & 4095;
+    if (_seq === 0) _lastMs += 1;
+    ts = _lastMs;
+  }
   const b = randomBytes(16);
   b[0] = ts / 2 ** 40 & 255;
   b[1] = ts / 2 ** 32 & 255;
@@ -7392,7 +7403,8 @@ function uuidv7() {
   b[3] = ts / 2 ** 16 & 255;
   b[4] = ts / 2 ** 8 & 255;
   b[5] = ts & 255;
-  b[6] = b[6] & 15 | 112;
+  b[6] = 112 | _seq >> 8 & 15;
+  b[7] = _seq & 255;
   b[8] = b[8] & 63 | 128;
   const hex = b.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
@@ -7430,10 +7442,11 @@ ${body}
 `;
 }
 function parseEnvelope(text) {
-  const m = text.match(/^---\n([\s\S]*?)\n---\n?/);
+  const normalized = text.replace(/\r\n/g, "\n");
+  const m = normalized.match(/^---\n([\s\S]*?)\n---\n?/);
   if (!m) throw new Error("postbox: not a valid envelope (missing frontmatter)");
   const front = import_yaml.default.parse(m[1]) ?? {};
-  return { ...front, body: text.slice(m[0].length) };
+  return { ...front, body: normalized.slice(m[0].length) };
 }
 
 // src/target-match.mjs
@@ -7491,9 +7504,32 @@ var Mailbox = class {
     const m = file.match(/^([0-9a-f-]{36})\.(.+)\.(\d+)\.md$/);
     return m ? { id: m[1], session: m[2], leaseMs: Number(m[3]), file } : null;
   }
+  /**
+   * A session name becomes a path segment in the claimed/ filename (`<id>.<session>.<ms>.md`),
+   * so a `/`, `\`, or NUL would escape the directory and make rename(2) throw ENOENT (read as a
+   * spurious "already-claimed"). Reject those up front with a clear error.
+   */
+  _validateSession(session) {
+    if (/[/\\\0]/.test(session)) {
+      throw new Error(`postbox: invalid session '${session}' \u2014 must not contain / \\ or NUL`);
+    }
+  }
   /** Read + parse an envelope from a state dir. */
   _read(state, file) {
     return parseEnvelope(readFileSync(join(this.dir, state, file), "utf8"));
+  }
+  /**
+   * Read + parse an envelope, returning null instead of throwing on a corrupt/half-written/
+   * non-envelope `.md` file. Keeps one bad file from making the whole inbox unreadable.
+   */
+  _readSafe(state, file) {
+    try {
+      return this._read(state, file);
+    } catch (e) {
+      process.stderr.write(`postbox: skipping unreadable ${state}/${file} (${e.code ?? e.message})
+`);
+      return null;
+    }
   }
   /** Mark an envelope surfaced-to a session (idempotency sentinel, SPEC §7). */
   markProcessed(session, id) {
@@ -7511,8 +7547,8 @@ var Mailbox = class {
   inbox({ consumer = null, asSource = null, unprocessedFor = null, now = Date.now(), sweep = true } = {}) {
     if (sweep) this.sweep({ now });
     const fresh = (e) => !unprocessedFor || !this.isProcessed(unprocessedFor, e.id);
-    const ready = consumer ? this.list("ready").map((f) => this._read("ready", f)).filter((e) => matchesTarget(e.target, consumer)).filter(fresh) : [];
-    const done = asSource ? this.list("done").map((f) => this._read("done", f)).filter((e) => e.source_role === asSource).filter(fresh) : [];
+    const ready = consumer ? this.list("ready").map((f) => this._readSafe("ready", f)).filter(Boolean).filter((e) => matchesTarget(e.target, consumer)).filter(fresh) : [];
+    const done = asSource ? this.list("done").map((f) => this._readSafe("done", f)).filter(Boolean).filter((e) => e.source_role === asSource).filter(fresh) : [];
     return { ready, done };
   }
   /**
@@ -7534,7 +7570,12 @@ var Mailbox = class {
     renameSync(tmp, this._state("ready", `${env.id}.md`));
     return env;
   }
-  /** Atomically replace a file this process exclusively owns (tmp → fsync → rename). */
+  /**
+   * Atomically replace a file this process exclusively owns (tmp → fsync → rename). Guards
+   * against the rename(2) "create if missing" semantic: if a sweeper reclaimed `path` out from
+   * under us between our read and now, recreating it would ghost-resurrect a file in two states.
+   * We refuse and throw ENOENT so the caller can treat it as a lost race.
+   */
   _rewrite(path, env) {
     const tmp = join(this.dir, ".tmp", `${basename(path)}.tmp`);
     const fd = openSync(tmp, "w");
@@ -7543,6 +7584,10 @@ var Mailbox = class {
       fsyncSync(fd);
     } finally {
       closeSync(fd);
+    }
+    if (!existsSync(path)) {
+      rmSync(tmp, { force: true });
+      throw Object.assign(new Error(`postbox: ${path} vanished before rewrite`), { code: "ENOENT" });
     }
     renameSync(tmp, path);
   }
@@ -7554,6 +7599,7 @@ var Mailbox = class {
    */
   claim(id, { session, now = Date.now() } = {}) {
     if (!session) throw new Error("postbox: claim requires a session");
+    this._validateSession(session);
     const src = this._state("ready", `${id}.md`);
     const leaseExpMs = now + this.leaseTtlMs;
     const dst = this._state("claimed", `${id}.${session}.${leaseExpMs}.md`);
@@ -7563,16 +7609,23 @@ var Mailbox = class {
       if (e.code === "ENOENT") return { ok: false, reason: "already-claimed", id };
       throw e;
     }
-    const env = parseEnvelope(readFileSync(dst, "utf8"));
-    const leaseIso = new Date(leaseExpMs).toISOString();
-    env.status = "claimed";
-    env.lease_exp = leaseIso;
-    env.status_history = [
-      ...env.status_history ?? [],
-      { at: new Date(now).toISOString(), from: "ready", to: "claimed", by: session, lease_exp: leaseIso }
-    ];
-    this._rewrite(dst, env);
-    return { ok: true, id, session, leaseExpMs, path: dst };
+    const result = { ok: true, id, session, leaseExpMs, path: dst };
+    try {
+      const env = parseEnvelope(readFileSync(dst, "utf8"));
+      const leaseIso = new Date(leaseExpMs).toISOString();
+      env.status = "claimed";
+      env.lease_exp = leaseIso;
+      env.status_history = [
+        ...env.status_history ?? [],
+        { at: new Date(now).toISOString(), from: "ready", to: "claimed", by: session, lease_exp: leaseIso }
+      ];
+      this._rewrite(dst, env);
+    } catch (e) {
+      result.warning = `claim won but metadata update failed: ${e.code ?? e.message}`;
+      process.stderr.write(`postbox: ${result.warning}
+`);
+    }
+    return result;
   }
   /**
    * Report an outcome on a claim this session owns: append a `## Outcome` block + a
@@ -7581,12 +7634,19 @@ var Mailbox = class {
    */
   report(id, { session, outcome = null, now = Date.now() } = {}) {
     if (!session) throw new Error("postbox: report requires a session");
+    this._validateSession(session);
     const claimedDir = join(this.dir, "claimed");
     const file = readdirSync(claimedDir).map((f) => this._parseClaim(f)).find((c) => c && c.id === id && c.session === session)?.file;
     if (!file) return { ok: false, reason: "lease-not-owned", id };
     const src = join(claimedDir, file);
     const dst = this._state("done", `${id}.md`);
-    const env = parseEnvelope(readFileSync(src, "utf8"));
+    let env;
+    try {
+      env = parseEnvelope(readFileSync(src, "utf8"));
+    } catch (e) {
+      if (e.code === "ENOENT") return { ok: false, reason: "lease-expired", id };
+      throw e;
+    }
     env.status = "done";
     env.outcome_ref = outcome;
     env.status_history = [
@@ -7599,8 +7659,13 @@ var Mailbox = class {
 
 ${outcome ?? "(none)"}
 `;
-    this._rewrite(src, env);
-    renameSync(src, dst);
+    try {
+      this._rewrite(src, env);
+      renameSync(src, dst);
+    } catch (e) {
+      if (e.code === "ENOENT") return { ok: false, reason: "lease-expired", id };
+      throw e;
+    }
     return { ok: true, id, path: dst, outcome_ref: outcome };
   }
   /**
@@ -7623,15 +7688,22 @@ ${outcome ?? "(none)"}
         if (e.code === "ENOENT") continue;
         throw e;
       }
-      const env = parseEnvelope(readFileSync(dst, "utf8"));
-      env.status = "ready";
-      env.lease_exp = null;
-      env.status_history = [
-        ...env.status_history ?? [],
-        { at: new Date(now).toISOString(), from: "claimed", to: "ready", by: c.session, reason: "lease-expired" }
-      ];
-      this._rewrite(dst, env);
       reclaimed.push(c.id);
+      try {
+        const env = parseEnvelope(readFileSync(dst, "utf8"));
+        env.status = "ready";
+        env.lease_exp = null;
+        env.status_history = [
+          ...env.status_history ?? [],
+          { at: new Date(now).toISOString(), from: "claimed", to: "ready", by: c.session, reason: "lease-expired" }
+        ];
+        this._rewrite(dst, env);
+      } catch (e) {
+        if (e.code !== "ENOENT") {
+          process.stderr.write(`postbox: sweep could not update ${c.id} after reclaim (${e.code ?? e.message})
+`);
+        }
+      }
     }
     return { reclaimed };
   }
@@ -8343,10 +8415,15 @@ var DEFAULTS = {
 };
 var UNIT_MS = { ms: 1, s: 1e3, m: 6e4, h: 36e5, d: 864e5 };
 function parseDuration(value) {
-  if (typeof value === "number") return value;
+  if (typeof value === "number") {
+    if (value <= 0) throw new Error(`postbox: duration must be positive, got ${value}`);
+    return value;
+  }
   const m = String(value).match(/^(\d+)(ms|s|m|h|d)?$/);
   if (!m) throw new Error(`postbox: invalid duration '${value}'`);
-  return Number(m[1]) * (m[2] ? UNIT_MS[m[2]] : 1);
+  const ms = Number(m[1]) * (m[2] ? UNIT_MS[m[2]] : 1);
+  if (ms <= 0) throw new Error(`postbox: lease duration '${value}' resolves to 0ms; use a positive duration`);
+  return ms;
 }
 function findConfigFile(start) {
   let dir = resolve(start);
@@ -8416,7 +8493,16 @@ function parseArgs(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (a === "-h") {
+      flags.help = true;
+      continue;
+    }
     if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      if (eq !== -1) {
+        flags[a.slice(2, eq)] = a.slice(eq + 1);
+        continue;
+      }
       const key = a.slice(2);
       const next = argv[i + 1];
       if (next === void 0 || next.startsWith("--")) flags[key] = true;
@@ -8437,8 +8523,78 @@ var fail = (msg, code) => {
 `);
   process.exit(code);
 };
+var HELP = {
+  "": `postbox \u2014 a server-free mailbox for agent sessions (atomic-rename Maildir pattern).
+
+Usage: postbox <command> [options]
+
+Commands:
+  send     mint a uuidv7 envelope into ready/, addressed to a target
+  inbox    list envelopes addressed to this session (+ completions for the writer)
+  claim    take a ready envelope (race-free CAS); exit 3 if already claimed
+  report   record an outcome on a claim you own; exit 4 if you don't own the lease
+  sweep    reclaim expired leases back to ready/
+  doctor   verify atomic rename works on this filesystem
+  init     scaffold a .postbox.toml + print the settings.json snippets
+  wire     bulk-wire many folders onto one shared mailbox
+  migrate  migrate a legacy flat _briefs/ dir onto the postbox schema
+
+Global options:
+  --dir <path>      mailbox dir (overrides $POSTBOX_DIR and .postbox.toml handoff_dir)
+  --tenant <id>     tenant_id to stamp (default: from config)
+  --json            machine-readable JSON output
+  -h, --help        show help (use \`postbox help <command>\` for command detail)
+
+Run \`postbox help <command>\` for per-command usage and exit codes.`,
+  send: `postbox send --type <type> --target <addr> [--source <role>] [--body "..." | --body-file <path>]
+
+Required: --type, --target
+Output (JSON): { id, status, path }
+Exit codes: 0 sent \xB7 2 usage error`,
+  inbox: `postbox inbox [--identities <addr,...>] [--cwd <path>] [--as-source <role>]
+              [--session <name> [--mark-processed]] [--format human|json|pointer] [--json]
+
+Consumer matching comes from --identities/--cwd or .postbox.toml. --session enables
+unprocessed-only filtering; add --mark-processed to advance the dedup sentinel (the two
+are co-dependent \u2014 --mark-processed without --session is a usage error).
+Exit codes: 0 ok \xB7 2 usage error`,
+  claim: `postbox claim <id> --session <name>
+
+Output (JSON): { ok, id, session, leaseExpMs, path } | { ok:false, reason }
+Exit codes: 0 claimed \xB7 3 already-claimed \xB7 2 usage error`,
+  report: `postbox report <id> --session <name> [--outcome "<PR url / commit / note>"]
+
+Output (JSON): { ok, id, path, outcome_ref } | { ok:false, reason }
+Exit codes: 0 reported \xB7 4 lease-not-owned/expired \xB7 2 usage error`,
+  sweep: `postbox sweep
+
+Reclaims expired claimed/ leases back to ready/. Output (JSON): { reclaimed: [id,...] }
+Exit codes: 0 ok`,
+  doctor: `postbox doctor [--dir <path>]
+
+Verifies atomic rename works in the mailbox dir; warns on NFS/overlayfs/SMB.
+Exit codes: 0 ok \xB7 5 unsafe filesystem`,
+  init: `postbox init [--mailbox <dir>] [--match role|explicit-list|cwd-glob] [--identity <addr,...>]
+
+Writes a .postbox.toml in the cwd (never clobbers an existing one) and prints the
+settings.json write-boundary + inbox-hook snippets. Exit codes: 0 ok`,
+  wire: `postbox wire <folder...> --mailbox <dir> [--with-hooks] [--apply]
+       postbox wire --all <parent> [--exclude a,b] --mailbox <dir> [--apply]
+
+Dry-run until --apply. Never clobbers an existing .postbox.toml. --with-hooks also merges
+the inbox pointer hook into each folder's .claude/settings.json. Exit codes: 0 ok`,
+  migrate: `postbox migrate --from <legacy-briefs-dir> [--to <dir>] [--apply]
+
+Dry-run until --apply (idempotent; skips already-migrated files). Never deletes the source.
+Without --to, writes in place into <from>/ready/ and <from>/done/. Exit codes: 0 ok`
+};
+function printHelp(sub) {
+  process.stdout.write(`${HELP[sub] ?? HELP[""]}
+`);
+}
 function buildConsumer(flags, config) {
-  if (flags.identities) return { mode: "role", identities: String(flags.identities).split(",") };
+  const identities = flags.identities ?? flags.identity;
+  if (identities) return { mode: "role", identities: String(identities).split(",") };
   if (flags.cwd) return { mode: "cwd-glob", cwd: String(flags.cwd) };
   if (config.identities.length || config.targetMatch === "cwd-glob") {
     return { mode: config.targetMatch, identities: config.identities, cwd: config.cwd };
@@ -8448,6 +8604,10 @@ function buildConsumer(flags, config) {
 function main() {
   const { positionals, flags } = parseArgs(process.argv.slice(2));
   const cmd = positionals[0];
+  if (flags.help || cmd === "help" || !cmd) {
+    printHelp(cmd === "help" ? positionals[1] : cmd);
+    return EXIT.OK;
+  }
   const config = loadConfig(process.cwd());
   const dir = flags.dir ?? process.env.POSTBOX_DIR ?? config.handoffDir;
   const mkMailbox = () => new Mailbox({
@@ -8458,35 +8618,43 @@ function main() {
   switch (cmd) {
     case "send": {
       const mb = mkMailbox();
-      const body = flags["body-file"] ? readFileSync3(String(flags["body-file"]), "utf8") : flags.body === true ? "" : flags.body ?? "";
+      if (flags.body === true) fail('--body requires a value; use --body "..." or --body-file <path>', EXIT.USAGE);
+      const body = flags["body-file"] ? readFileSync3(String(flags["body-file"]), "utf8") : flags.body ?? "";
       if (!flags.type || !flags.target) fail("send requires --type and --target", EXIT.USAGE);
       const env = mb.send({ type: String(flags.type), target: String(flags.target), sourceRole: flags.source ? String(flags.source) : void 0, body });
       out({ id: env.id, status: "ready", path: join3(dir, "ready", `${env.id}.md`) });
       return EXIT.OK;
     }
     case "inbox": {
+      if (flags["mark-processed"] && !flags.session) fail("--mark-processed requires --session", EXIT.USAGE);
       const mb = mkMailbox();
+      const consumer = buildConsumer(flags, config);
+      const asSource = flags["as-source"] ? String(flags["as-source"]) : null;
+      if (!consumer && !asSource) {
+        process.stderr.write("postbox: no consumer identity configured \u2014 set identities in .postbox.toml or pass --identities. Showing nothing.\n");
+      }
       const res = mb.inbox({
-        consumer: buildConsumer(flags, config),
-        asSource: flags["as-source"] ? String(flags["as-source"]) : null,
+        consumer,
+        asSource,
         unprocessedFor: flags.session ? String(flags.session) : null
       });
       if (flags.session && flags["mark-processed"]) {
         for (const e of [...res.ready, ...res.done]) mb.markProcessed(String(flags.session), e.id);
       }
-      renderInbox(res, flags.format ? String(flags.format) : "human", dir);
+      const format = flags.json ? "json" : flags.format ? String(flags.format) : "human";
+      renderInbox(res, format, dir);
       return EXIT.OK;
     }
     case "claim": {
-      const id = positionals[1];
-      if (!id || !flags.session) fail("claim requires <id> and --session", EXIT.USAGE);
+      const id = positionals[1] ?? (typeof flags.id === "string" ? flags.id : void 0);
+      if (!id || !flags.session) fail("usage: postbox claim <id> --session <name>", EXIT.USAGE);
       const res = mkMailbox().claim(id, { session: String(flags.session) });
       out(res);
       return res.ok ? EXIT.OK : EXIT.ALREADY_CLAIMED;
     }
     case "report": {
-      const id = positionals[1];
-      if (!id || !flags.session) fail("report requires <id> and --session", EXIT.USAGE);
+      const id = positionals[1] ?? (typeof flags.id === "string" ? flags.id : void 0);
+      if (!id || !flags.session) fail('usage: postbox report <id> --session <name> [--outcome "<ref>"]', EXIT.USAGE);
       const res = mkMailbox().report(id, { session: String(flags.session), outcome: flags.outcome ? String(flags.outcome) : null });
       out(res);
       return res.ok ? EXIT.OK : EXIT.LEASE_NOT_OWNED;
@@ -8533,7 +8701,7 @@ function doctor(dir) {
     const b = join3(dir, ".tmp", "doctor.b");
     writeFileSync2(a, "x");
     renameSync2(a, b);
-    rmSync(b, { force: true });
+    rmSync2(b, { force: true });
   } catch (e) {
     out({ ok: false, dir, error: e.code ?? String(e), note: "atomic rename failed \u2014 postbox is unsafe on this filesystem" });
     return EXIT.UNSAFE_FS;
@@ -8545,7 +8713,8 @@ function init(flags = {}) {
   const path = join3(process.cwd(), ".postbox.toml");
   const mailbox = flags.mailbox ? String(flags.mailbox) : "_briefs";
   const match = flags.match ? String(flags.match) : "role";
-  const identities = flags.identity ? String(flags.identity).split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const identityFlag = flags.identity ?? flags.identities;
+  const identities = identityFlag ? String(identityFlag).split(",").map((s) => s.trim()).filter(Boolean) : [];
   const idLine = identities.length ? `[${identities.map((i) => `"${i}"`).join(", ")}]` : "[]";
   const toml = `# .postbox.toml \u2014 all keys optional (SPEC \xA710)
 handoff_dir  = "${mailbox}"
@@ -8704,10 +8873,38 @@ function migrate(flags) {
     return EXIT.OK;
   }
   const to = flags.to ? String(flags.to) : from;
+  if (!flags.to) {
+    process.stderr.write(`postbox: --to not specified; writing into ${join3(to, "ready")}/ and ${join3(to, "done")}/ (in-place upgrade). Pass --to <dir> to write elsewhere.
+`);
+  }
   new Mailbox({ dir: to });
-  for (const r of ok) writeFileSync2(join3(to, r._env.status, `${r._env.id}.md`), serializeEnvelope(r._env));
-  out({ applied: true, ...summary, to });
+  const migratedDir = join3(to, ".migrated");
+  mkdirSync2(migratedDir, { recursive: true });
+  let written = 0;
+  let already = 0;
+  for (const r of ok) {
+    const sentinel = join3(migratedDir, r.file);
+    if (existsSync3(sentinel)) {
+      already++;
+      continue;
+    }
+    atomicWrite(to, join3(to, r._env.status, `${r._env.id}.md`), serializeEnvelope(r._env));
+    writeFileSync2(sentinel, r._env.id);
+    written++;
+  }
+  out({ applied: true, ...summary, to, written, alreadyMigrated: already });
   return EXIT.OK;
+}
+function atomicWrite(baseDir, destPath, content) {
+  const tmp = join3(baseDir, ".tmp", `${basename2(destPath)}.migrate.tmp`);
+  const fd = openSync2(tmp, "w");
+  try {
+    writeFileSync2(fd, content);
+    fsyncSync2(fd);
+  } finally {
+    closeSync2(fd);
+  }
+  renameSync2(tmp, destPath);
 }
 process.exit(main());
 /*! Bundled license information:

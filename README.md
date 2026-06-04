@@ -5,7 +5,7 @@
 > and the results flow back on their own.
 
 **Status:** early / pre-1.0, but working — the spec ([`SPEC.md`](./SPEC.md)) is stable and the
-CLI ships green (71 tests, incl. a 32-process claim race). Files-only, no server, MIT licensed.
+CLI ships green (89 tests, incl. a 32-process claim race). Files-only, no server, MIT licensed.
 
 ---
 
@@ -63,6 +63,29 @@ npx postbox doctor            # one-off
 
 ```js
 import { Mailbox } from 'postbox';   // programmatic use
+```
+
+*Dev mode* and `--plugin-dir` point at the **repo root** (which contains the
+`.claude-plugin/plugin.json` manifest), not at the `.claude-plugin/` dir itself.
+
+### Library API
+
+`import … from 'postbox'` exposes:
+
+| export | kind | purpose |
+|---|---|---|
+| `Mailbox` | class | the state machine: `.send()`, `.inbox()`, `.claim()`, `.report()`, `.sweep()`, `.markProcessed()` |
+| `STATES` | const | `['ready','claimed','done','dead']` |
+| `createEnvelope` / `serializeEnvelope` / `parseEnvelope` | fn | build / write / read the envelope format |
+| `matchesTarget` | fn | does an envelope `target` match a consumer (role / explicit-list / cwd-glob) |
+| `uuidv7` | fn | mint a time-ordered, monotonic uuidv7 |
+| `loadConfig` / `parseDuration` | fn | resolve `.postbox.toml` for a cwd / parse a `60m`-style duration |
+
+```js
+import { Mailbox, loadConfig } from 'postbox';
+const { handoffDir, tenantId, leaseTtlMs } = loadConfig(process.cwd());
+const mb = new Mailbox({ dir: handoffDir, tenantId, leaseTtlMs });
+const env = mb.send({ type: 'brief', target: 'product:foo', sourceRole: 'orchestrator', body: '# do X' });
 ```
 
 ## Wire your folders onto one shared mailbox
