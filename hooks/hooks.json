@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/postbox.mjs\" inbox --format pointer 2>/dev/null || true"
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/postbox.mjs\" inbox --session \"${CLAUDE_PROJECT_DIR:-$PWD}\" --mark-processed --format pointer 2>/dev/null || true"
           }
         ]
       }
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/postbox.mjs\" inbox --format pointer 2>/dev/null || true"
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/postbox.mjs\" inbox --session \"${CLAUDE_PROJECT_DIR:-$PWD}\" --mark-processed --format pointer 2>/dev/null || true"
           }
         ]
       }

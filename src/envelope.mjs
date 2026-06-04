@@ -39,8 +39,11 @@ export function serializeEnvelope(env) {
  * is left untouched.
  */
 export function parseEnvelope(text) {
-  const m = text.match(/^---\n([\s\S]*?)\n---\n?/);
+  // Tolerate CRLF (Windows tooling / git core.autocrlf) so a `\r\n`-encoded envelope is not
+  // mis-reported as "missing frontmatter". Normalize before matching the `\n`-anchored fence.
+  const normalized = text.replace(/\r\n/g, '\n');
+  const m = normalized.match(/^---\n([\s\S]*?)\n---\n?/);
   if (!m) throw new Error('postbox: not a valid envelope (missing frontmatter)');
   const front = YAML.parse(m[1]) ?? {};
-  return { ...front, body: text.slice(m[0].length) };
+  return { ...front, body: normalized.slice(m[0].length) };
 }

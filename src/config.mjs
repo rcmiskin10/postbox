@@ -16,10 +16,17 @@ const UNIT_MS = { ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000 };
 
 /** Parse a duration like `60m` / `2h` / `1d` / `500` (bare = ms) → milliseconds. */
 export function parseDuration(value) {
-  if (typeof value === 'number') return value;
+  if (typeof value === 'number') {
+    if (value <= 0) throw new Error(`postbox: duration must be positive, got ${value}`);
+    return value;
+  }
   const m = String(value).match(/^(\d+)(ms|s|m|h|d)?$/);
   if (!m) throw new Error(`postbox: invalid duration '${value}'`);
-  return Number(m[1]) * (m[2] ? UNIT_MS[m[2]] : 1);
+  const ms = Number(m[1]) * (m[2] ? UNIT_MS[m[2]] : 1);
+  // A zero lease expires the instant it is claimed — the first opportunistic sweep reclaims it
+  // before the owner can report. Reject it rather than silently breaking every claim.
+  if (ms <= 0) throw new Error(`postbox: lease duration '${value}' resolves to 0ms; use a positive duration`);
+  return ms;
 }
 
 /** Find the nearest `.postbox.toml` walking up from `start`, or null. */

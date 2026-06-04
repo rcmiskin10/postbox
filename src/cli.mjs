@@ -2,7 +2,7 @@
 // Source of truth for the `postbox` command; bundled to bin/postbox.mjs (zero-dep) by `pnpm build`.
 // All correctness (CAS-on-source, leases, return channel) lives in src/; this file only
 // parses args, picks a command, and maps results to stable exit codes.
-import { writeFileSync, renameSync, rmSync, readFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs';
+import { writeFileSync, renameSync, rmSync, readFileSync, existsSync, readdirSync, mkdirSync, openSync, fsyncSync, closeSync } from 'node:fs';
 import { join, relative, basename, dirname, resolve as resolvePath } from 'node:path';
 import { Mailbox } from './mailbox.mjs';
 import { loadConfig } from './config.mjs';
@@ -16,7 +16,10 @@ function parseArgs(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (a === '-h') { flags.help = true; continue; }
     if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      if (eq !== -1) { flags[a.slice(2, eq)] = a.slice(eq + 1); continue; } // --key=value form
       const key = a.slice(2);
       const next = argv[i + 1];
       if (next === undefined || next.startsWith('--')) flags[key] = true;
@@ -31,8 +34,80 @@ function parseArgs(argv) {
 const out = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 const fail = (msg, code) => { process.stderr.write(`postbox: ${msg}\n`); process.exit(code); };
 
+const HELP = {
+  '': `postbox — a server-free mailbox for agent sessions (atomic-rename Maildir pattern).
+
+Usage: postbox <command> [options]
+
+Commands:
+  send     mint a uuidv7 envelope into ready/, addressed to a target
+  inbox    list envelopes addressed to this session (+ completions for the writer)
+  claim    take a ready envelope (race-free CAS); exit 3 if already claimed
+  report   record an outcome on a claim you own; exit 4 if you don't own the lease
+  sweep    reclaim expired leases back to ready/
+  doctor   verify atomic rename works on this filesystem
+  init     scaffold a .postbox.toml + print the settings.json snippets
+  wire     bulk-wire many folders onto one shared mailbox
+  migrate  migrate a legacy flat _briefs/ dir onto the postbox schema
+
+Global options:
+  --dir <path>      mailbox dir (overrides $POSTBOX_DIR and .postbox.toml handoff_dir)
+  --tenant <id>     tenant_id to stamp (default: from config)
+  --json            machine-readable JSON output
+  -h, --help        show help (use \`postbox help <command>\` for command detail)
+
+Run \`postbox help <command>\` for per-command usage and exit codes.`,
+  send: `postbox send --type <type> --target <addr> [--source <role>] [--body "..." | --body-file <path>]
+
+Required: --type, --target
+Output (JSON): { id, status, path }
+Exit codes: 0 sent · 2 usage error`,
+  inbox: `postbox inbox [--identities <addr,...>] [--cwd <path>] [--as-source <role>]
+              [--session <name> [--mark-processed]] [--format human|json|pointer] [--json]
+
+Consumer matching comes from --identities/--cwd or .postbox.toml. --session enables
+unprocessed-only filtering; add --mark-processed to advance the dedup sentinel (the two
+are co-dependent — --mark-processed without --session is a usage error).
+Exit codes: 0 ok · 2 usage error`,
+  claim: `postbox claim <id> --session <name>
+
+Output (JSON): { ok, id, session, leaseExpMs, path } | { ok:false, reason }
+Exit codes: 0 claimed · 3 already-claimed · 2 usage error`,
+  report: `postbox report <id> --session <name> [--outcome "<PR url / commit / note>"]
+
+Output (JSON): { ok, id, path, outcome_ref } | { ok:false, reason }
+Exit codes: 0 reported · 4 lease-not-owned/expired · 2 usage error`,
+  sweep: `postbox sweep
+
+Reclaims expired claimed/ leases back to ready/. Output (JSON): { reclaimed: [id,...] }
+Exit codes: 0 ok`,
+  doctor: `postbox doctor [--dir <path>]
+
+Verifies atomic rename works in the mailbox dir; warns on NFS/overlayfs/SMB.
+Exit codes: 0 ok · 5 unsafe filesystem`,
+  init: `postbox init [--mailbox <dir>] [--match role|explicit-list|cwd-glob] [--identity <addr,...>]
+
+Writes a .postbox.toml in the cwd (never clobbers an existing one) and prints the
+settings.json write-boundary + inbox-hook snippets. Exit codes: 0 ok`,
+  wire: `postbox wire <folder...> --mailbox <dir> [--with-hooks] [--apply]
+       postbox wire --all <parent> [--exclude a,b] --mailbox <dir> [--apply]
+
+Dry-run until --apply. Never clobbers an existing .postbox.toml. --with-hooks also merges
+the inbox pointer hook into each folder's .claude/settings.json. Exit codes: 0 ok`,
+  migrate: `postbox migrate --from <legacy-briefs-dir> [--to <dir>] [--apply]
+
+Dry-run until --apply (idempotent; skips already-migrated files). Never deletes the source.
+Without --to, writes in place into <from>/ready/ and <from>/done/. Exit codes: 0 ok`,
+};
+
+function printHelp(sub) {
+  process.stdout.write(`${HELP[sub] ?? HELP['']}\n`);
+}
+
 function buildConsumer(flags, config) {
-  if (flags.identities) return { mode: 'role', identities: String(flags.identities).split(',') };
+  // accept --identity (singular, the spelling `init` prints) as an alias of --identities
+  const identities = flags.identities ?? flags.identity;
+  if (identities) return { mode: 'role', identities: String(identities).split(',') };
   if (flags.cwd) return { mode: 'cwd-glob', cwd: String(flags.cwd) };
   // derive from config so a hook can run `postbox inbox` with no flags
   if (config.identities.length || config.targetMatch === 'cwd-glob') {
@@ -44,6 +119,13 @@ function buildConsumer(flags, config) {
 function main() {
   const { positionals, flags } = parseArgs(process.argv.slice(2));
   const cmd = positionals[0];
+
+  // `-h` / `--help` (on any command), the `help` command, and a bare `postbox` print usage.
+  if (flags.help || cmd === 'help' || !cmd) {
+    printHelp(cmd === 'help' ? positionals[1] : cmd);
+    return EXIT.OK;
+  }
+
   const config = loadConfig(process.cwd());
   const dir = flags.dir ?? process.env.POSTBOX_DIR ?? config.handoffDir;
   const mkMailbox = () => new Mailbox({
@@ -55,35 +137,44 @@ function main() {
   switch (cmd) {
     case 'send': {
       const mb = mkMailbox();
-      const body = flags['body-file'] ? readFileSync(String(flags['body-file']), 'utf8') : (flags.body === true ? '' : flags.body ?? '');
+      if (flags.body === true) fail('--body requires a value; use --body "..." or --body-file <path>', EXIT.USAGE);
+      const body = flags['body-file'] ? readFileSync(String(flags['body-file']), 'utf8') : (flags.body ?? '');
       if (!flags.type || !flags.target) fail('send requires --type and --target', EXIT.USAGE);
       const env = mb.send({ type: String(flags.type), target: String(flags.target), sourceRole: flags.source ? String(flags.source) : undefined, body });
       out({ id: env.id, status: 'ready', path: join(dir, 'ready', `${env.id}.md`) });
       return EXIT.OK;
     }
     case 'inbox': {
+      if (flags['mark-processed'] && !flags.session) fail('--mark-processed requires --session', EXIT.USAGE);
       const mb = mkMailbox();
+      const consumer = buildConsumer(flags, config);
+      const asSource = flags['as-source'] ? String(flags['as-source']) : null;
+      if (!consumer && !asSource) {
+        process.stderr.write('postbox: no consumer identity configured — set identities in .postbox.toml or pass --identities. Showing nothing.\n');
+      }
       const res = mb.inbox({
-        consumer: buildConsumer(flags, config),
-        asSource: flags['as-source'] ? String(flags['as-source']) : null,
+        consumer,
+        asSource,
         unprocessedFor: flags.session ? String(flags.session) : null,
       });
       if (flags.session && flags['mark-processed']) {
         for (const e of [...res.ready, ...res.done]) mb.markProcessed(String(flags.session), e.id);
       }
-      renderInbox(res, flags.format ? String(flags.format) : 'human', dir);
+      // --json is the universal machine-output flag; --format keeps pointer|json|human.
+      const format = flags.json ? 'json' : (flags.format ? String(flags.format) : 'human');
+      renderInbox(res, format, dir);
       return EXIT.OK;
     }
     case 'claim': {
-      const id = positionals[1];
-      if (!id || !flags.session) fail('claim requires <id> and --session', EXIT.USAGE);
+      const id = positionals[1] ?? (typeof flags.id === 'string' ? flags.id : undefined);
+      if (!id || !flags.session) fail('usage: postbox claim <id> --session <name>', EXIT.USAGE);
       const res = mkMailbox().claim(id, { session: String(flags.session) });
       out(res);
       return res.ok ? EXIT.OK : EXIT.ALREADY_CLAIMED;
     }
     case 'report': {
-      const id = positionals[1];
-      if (!id || !flags.session) fail('report requires <id> and --session', EXIT.USAGE);
+      const id = positionals[1] ?? (typeof flags.id === 'string' ? flags.id : undefined);
+      if (!id || !flags.session) fail('usage: postbox report <id> --session <name> [--outcome "<ref>"]', EXIT.USAGE);
       const res = mkMailbox().report(id, { session: String(flags.session), outcome: flags.outcome ? String(flags.outcome) : null });
       out(res);
       return res.ok ? EXIT.OK : EXIT.LEASE_NOT_OWNED;
@@ -146,8 +237,9 @@ function init(flags = {}) {
   const path = join(process.cwd(), '.postbox.toml');
   const mailbox = flags.mailbox ? String(flags.mailbox) : '_briefs';
   const match = flags.match ? String(flags.match) : 'role';
-  const identities = flags.identity
-    ? String(flags.identity).split(',').map((s) => s.trim()).filter(Boolean)
+  const identityFlag = flags.identity ?? flags.identities; // accept either spelling
+  const identities = identityFlag
+    ? String(identityFlag).split(',').map((s) => s.trim()).filter(Boolean)
     : [];
   const idLine = identities.length ? `[${identities.map((i) => `"${i}"`).join(', ')}]` : '[]';
   const toml = `# .postbox.toml — all keys optional (SPEC §10)
@@ -312,10 +404,40 @@ function migrate(flags) {
     return EXIT.OK;
   }
   const to = flags.to ? String(flags.to) : from;
-  new Mailbox({ dir: to }); // ensure ready/ done/ dirs exist
-  for (const r of ok) writeFileSync(join(to, r._env.status, `${r._env.id}.md`), serializeEnvelope(r._env));
-  out({ applied: true, ...summary, to });
+  if (!flags.to) {
+    process.stderr.write(`postbox: --to not specified; writing into ${join(to, 'ready')}/ and ${join(to, 'done')}/ (in-place upgrade). Pass --to <dir> to write elsewhere.\n`);
+  }
+  new Mailbox({ dir: to }); // ensure ready/ done/ dirs + .tmp/ exist
+  // Idempotency: a sentinel per source filename means re-running --apply skips already-migrated
+  // briefs instead of minting fresh UUIDs and accumulating duplicates.
+  const migratedDir = join(to, '.migrated');
+  mkdirSync(migratedDir, { recursive: true });
+  let written = 0;
+  let already = 0;
+  for (const r of ok) {
+    const sentinel = join(migratedDir, r.file);
+    if (existsSync(sentinel)) { already++; continue; }
+    // atomic write (tmp → fsync → rename) so a crash mid-migration never leaves a half-written
+    // envelope visible in ready/ or done/ (which would then break every inbox read).
+    atomicWrite(to, join(to, r._env.status, `${r._env.id}.md`), serializeEnvelope(r._env));
+    writeFileSync(sentinel, r._env.id);
+    written++;
+  }
+  out({ applied: true, ...summary, to, written, alreadyMigrated: already });
   return EXIT.OK;
+}
+
+// tmp → fsync → rename within `baseDir/.tmp` (same FS as the destination), mirroring Mailbox.send.
+function atomicWrite(baseDir, destPath, content) {
+  const tmp = join(baseDir, '.tmp', `${basename(destPath)}.migrate.tmp`);
+  const fd = openSync(tmp, 'w');
+  try {
+    writeFileSync(fd, content);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, destPath);
 }
 
 process.exit(main());
