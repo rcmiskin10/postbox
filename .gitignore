@@ -10,3 +10,6 @@ dist/
 *.log
 # local config
 .postbox.local.toml
+
+# local pnpm store (sandbox writable; not for commit)
+.pnpm-store/

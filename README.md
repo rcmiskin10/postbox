@@ -4,8 +4,8 @@
 > different folders hand work off to each other through files — race-free, server-free —
 > and the results flow back on their own.
 
-**Status:** early / pre-1.0. The spec ([`SPEC.md`](./SPEC.md)) is stable; the CLI is being
-built. Files-only, no server, MIT licensed.
+**Status:** early / pre-1.0, but working — the spec ([`SPEC.md`](./SPEC.md)) is stable and the
+CLI ships green (71 tests, incl. a 32-process claim race). Files-only, no server, MIT licensed.
 
 ---
 
@@ -36,21 +36,66 @@ session, then relay the result back by hand. postbox automates the delivery **an
 return trip, while keeping the boundary real: it *moves* envelopes, it does not write across
 your permission boundary (that stays in your `settings.json`).
 
-## Install (Claude Code plugin)
+## Install
 
-```bash
-# dev mode (until published to a marketplace)
-claude --plugin-dir /path/to/postbox
+### As a Claude Code plugin (recommended)
+
+The repo is its own plugin marketplace. From any Claude Code session:
+
+```
+/plugin marketplace add rcmiskin10/postbox
+/plugin install postbox
 ```
 
-Then in any workspace:
+That gives every session the `/postbox:*` commands and a SessionStart/UserPromptSubmit hook
+that auto-surfaces handoffs addressed to it. The `bin/postbox.mjs` it runs is a self-contained
+zero-dependency bundle, so there's nothing to `npm install`.
+
+*Dev mode* (try it before installing): `claude --plugin-dir /path/to/postbox`.
+
+### As a CLI / library (npm)
 
 ```bash
-postbox init          # writes .postbox.toml + prints the settings.json boundary snippet
+npm install -g postbox        # the `postbox` command
+# or
+npx postbox doctor            # one-off
+```
+
+```js
+import { Mailbox } from 'postbox';   // programmatic use
+```
+
+## Wire your folders onto one shared mailbox
+
+Each participating folder needs a `.postbox.toml` pointing at the shared mailbox. Do one folder
+with `init`, or all of them at once with `wire`:
+
+```bash
+postbox init                                            # scaffold THIS folder's config
+postbox wire --all ./projects --mailbox ./_briefs --apply   # bulk-wire every subfolder
+postbox wire ./apps/web ./apps/api --mailbox ./_briefs --apply   # or name them explicitly
+```
+
+`wire` is dry-run until `--apply`, never clobbers an existing `.postbox.toml`, and takes
+`--exclude a,b` to skip folders. Add `--with-hooks` only for **non-plugin** installs (the
+plugin already ships the inbox hooks) to also merge the SessionStart/UserPromptSubmit pointer
+into each folder's `.claude/settings.json`.
+
+## The verbs
+
+```bash
 /postbox:send         # (in the orchestrator) address a task to a worker session
 /postbox:inbox        # (in the worker) read what's addressed to you — also auto-surfaced on session start
-/postbox:claim <id>   # take it (race-free)
+/postbox:claim <id>   # take it (race-free; exit 3 = already taken)
 /postbox:report <id>  # finish it; the outcome flows back to the sender
+```
+
+## Build from source
+
+```bash
+pnpm install          # also builds bin/postbox.mjs via the prepare script
+pnpm build            # rebuild the zero-dep bundle (src/cli.mjs → bin/postbox.mjs)
+pnpm test             # builds, then runs the suite
 ```
 
 ## Design contract (5 axes)

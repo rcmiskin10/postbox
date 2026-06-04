@@ -1,0 +1,18 @@
+{
+  "name": "postbox",
+  "owner": {
+    "name": "Ricky Miskin",
+    "url": "https://github.com/rcmiskin10"
+  },
+  "metadata": {
+    "description": "postbox — a race-free, server-free mailbox for handing work off between agent sessions.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "postbox",
+      "source": ".",
+      "description": "Cross-session task handoff via the Maildir atomic-rename pattern: send, claim, and report flow through Markdown envelope files; results return on their own. No server, no database."
+    }
+  ]
+}

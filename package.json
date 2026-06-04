@@ -17,6 +17,9 @@
     "LICENSE"
   ],
   "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepare": "npm run build",
+    "pretest": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "postbox": "node bin/postbox.mjs"
@@ -40,6 +43,7 @@
     "yaml": "^2.5.0"
   },
   "devDependencies": {
+    "esbuild": "^0.28.0",
     "vitest": "^2.1.0"
   }
 }
