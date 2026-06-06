@@ -107,8 +107,8 @@ into each folder's `.claude/settings.json`.
 ## The verbs
 
 ```bash
-/postbox:send         # (in the orchestrator) address a task to a worker session
-/postbox:inbox        # (in the worker) read what's addressed to you — also auto-surfaced on session start
+/postbox:send         # (in the orchestrator) address an envelope to a consumer session
+/postbox:inbox        # (in the consumer) read what's addressed to you — also auto-surfaced on session start
 /postbox:claim <id>   # take it (race-free; exit 3 = already taken)
 /postbox:report <id>  # finish it; the outcome flows back to the sender
 ```
@@ -139,7 +139,15 @@ owns the one thing the platform isn't standardizing: **the envelope schema + the
 status-in-path convention + the return-channel protocol.** When native agent mailboxes
 (e.g. `agent-teams`) mature, postbox adds a one-way bridge *into* them rather than competing.
 
-Full design rationale: [`SPEC.md`](./SPEC.md).
+## Docs
+
+- [`SPEC.md`](./SPEC.md) — the normative spec; a second engineer can reimplement postbox from it alone.
+- [`docs/api.md`](./docs/api.md) — the library API (`Mailbox`, `loadConfig`, envelope helpers).
+- [`docs/plugin-setup.md`](./docs/plugin-setup.md) — plugin install, `.postbox.toml`, `wire`, hooks, the write boundary.
+- [`docs/target-matching.md`](./docs/target-matching.md) — the `role` / `explicit-list` / `cwd-glob` modes.
+- [`docs/migration.md`](./docs/migration.md) — moving a legacy flat `_briefs/` dir onto the schema.
+- [`docs/atomicity.md`](./docs/atomicity.md) — why it's race-free without locks; the NFS caveat.
+- [`CHANGELOG.md`](./CHANGELOG.md) — release history.
 
 ## License
 
