@@ -11,7 +11,7 @@
   "plugins": [
     {
       "name": "postbox",
-      "source": ".",
+      "source": "./",
       "description": "Cross-session task handoff via the Maildir atomic-rename pattern: send, claim, and report flow through Markdown envelope files; results return on their own. No server, no database."
     }
   ]
