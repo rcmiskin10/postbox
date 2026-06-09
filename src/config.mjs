@@ -8,9 +8,25 @@ const DEFAULTS = {
   lease_ttl: '60m',
   target_match: 'role',
   identities: [],
+  session: null,
+  source_role: null,
   filename_pattern: '<uuid>.md',
   retention: '30d',
 };
+
+/**
+ * The session name a generic hook should dedup against. Explicit `session` key wins; otherwise
+ * fall back to the `session:<name>` identity convention, so a folder wired the normal way needs
+ * no extra key for `postbox inbox` (no flags) to behave like a hand-wired `--session` hook.
+ */
+function deriveSession(merged) {
+  if (merged.session) return merged.session;
+  for (const id of merged.identities ?? []) {
+    const m = /^session:(.+)$/.exec(id);
+    if (m) return m[1];
+  }
+  return null;
+}
 
 const UNIT_MS = { ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000 };
 
@@ -58,6 +74,8 @@ export function loadConfig(cwd) {
     leaseTtlMs: parseDuration(merged.lease_ttl),
     targetMatch: merged.target_match,
     identities: merged.identities ?? [],
+    session: deriveSession(merged),
+    sourceRole: merged.source_role ?? null,
     filenamePattern: merged.filename_pattern,
     configFile,
     cwd: resolve(cwd),

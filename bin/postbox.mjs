@@ -8410,9 +8410,19 @@ var DEFAULTS = {
   lease_ttl: "60m",
   target_match: "role",
   identities: [],
+  session: null,
+  source_role: null,
   filename_pattern: "<uuid>.md",
   retention: "30d"
 };
+function deriveSession(merged) {
+  if (merged.session) return merged.session;
+  for (const id of merged.identities ?? []) {
+    const m = /^session:(.+)$/.exec(id);
+    if (m) return m[1];
+  }
+  return null;
+}
 var UNIT_MS = { ms: 1, s: 1e3, m: 6e4, h: 36e5, d: 864e5 };
 function parseDuration(value) {
   if (typeof value === "number") {
@@ -8447,6 +8457,8 @@ function loadConfig(cwd) {
     leaseTtlMs: parseDuration(merged.lease_ttl),
     targetMatch: merged.target_match,
     identities: merged.identities ?? [],
+    session: deriveSession(merged),
+    sourceRole: merged.source_role ?? null,
     filenamePattern: merged.filename_pattern,
     configFile,
     cwd: resolve(cwd)
@@ -8537,6 +8549,7 @@ Commands:
   doctor   verify atomic rename works on this filesystem
   init     scaffold a .postbox.toml + print the settings.json snippets
   wire     bulk-wire many folders onto one shared mailbox
+  unwire   strip postbox inbox hooks (e.g. when switching to the installed plugin)
   migrate  migrate a legacy flat _briefs/ dir onto the postbox schema
 
 Global options:
@@ -8583,6 +8596,12 @@ settings.json write-boundary + inbox-hook snippets. Exit codes: 0 ok`,
 
 Dry-run until --apply. Never clobbers an existing .postbox.toml. --with-hooks also merges
 the inbox pointer hook into each folder's .claude/settings.json. Exit codes: 0 ok`,
+  unwire: `postbox unwire <folder...> [--apply]
+       postbox unwire --all <parent> [--exclude a,b] [--apply]
+
+Removes postbox inbox hooks from each folder's .claude/settings.json (inverse of
+wire --with-hooks). Use when switching to the installed plugin, whose own hooks then drive
+surfacing. Leaves .postbox.toml + allow-rules intact. Dry-run until --apply. Exit codes: 0 ok`,
   migrate: `postbox migrate --from <legacy-briefs-dir> [--to <dir>] [--apply]
 
 Dry-run until --apply (idempotent; skips already-migrated files). Never deletes the source.
@@ -8629,17 +8648,20 @@ function main() {
       if (flags["mark-processed"] && !flags.session) fail("--mark-processed requires --session", EXIT.USAGE);
       const mb = mkMailbox();
       const consumer = buildConsumer(flags, config);
-      const asSource = flags["as-source"] ? String(flags["as-source"]) : null;
+      const sessionFromFlag = flags.session ? String(flags.session) : null;
+      const session = sessionFromFlag ?? config.session;
+      const asSource = (flags["as-source"] ? String(flags["as-source"]) : null) ?? config.sourceRole;
+      const markProcessed = flags["mark-processed"] || !sessionFromFlag && !!session;
       if (!consumer && !asSource) {
         process.stderr.write("postbox: no consumer identity configured \u2014 set identities in .postbox.toml or pass --identities. Showing nothing.\n");
       }
       const res = mb.inbox({
         consumer,
         asSource,
-        unprocessedFor: flags.session ? String(flags.session) : null
+        unprocessedFor: session
       });
-      if (flags.session && flags["mark-processed"]) {
-        for (const e of [...res.ready, ...res.done]) mb.markProcessed(String(flags.session), e.id);
+      if (session && markProcessed) {
+        for (const e of [...res.ready, ...res.done]) mb.markProcessed(session, e.id);
       }
       const format = flags.json ? "json" : flags.format ? String(flags.format) : "human";
       renderInbox(res, format, dir);
@@ -8669,10 +8691,12 @@ function main() {
       return init(flags);
     case "wire":
       return wire(positionals, flags);
+    case "unwire":
+      return unwire(positionals, flags);
     case "migrate":
       return migrate(flags);
     default:
-      fail(`unknown command '${cmd ?? ""}'. Try: send | inbox | claim | report | sweep | doctor | init | wire | migrate`, EXIT.USAGE);
+      fail(`unknown command '${cmd ?? ""}'. Try: send | inbox | claim | report | sweep | doctor | init | wire | unwire | migrate`, EXIT.USAGE);
   }
 }
 function renderInbox(res, format, dir) {
@@ -8789,6 +8813,7 @@ tenant_id    = "default"
 lease_ttl    = "60m"
 target_match = "role"
 identities   = ["product:${name}", "session:${name}"]
+session      = "${name}"   # the generic plugin inbox hook dedups against this
 `;
 var WIRE_HOOK_EVENTS = ["SessionStart", "UserPromptSubmit"];
 var wireHookCommand = (name) => `postbox inbox --session ${name} --mark-processed --format pointer 2>/dev/null || true`;
@@ -8837,6 +8862,64 @@ function applyWire(p) {
     writeFileSync2(p.sjPath, `${JSON.stringify(p.sj, null, 2)}
 `);
   }
+}
+function unwire(positionals, flags) {
+  const apply = !!flags.apply;
+  let folders;
+  if (flags.all) {
+    const parent = resolvePath(process.cwd(), String(flags.all));
+    const exclude = new Set(String(flags.exclude ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+    folders = readdirSync2(parent, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith(".") && !exclude.has(d.name)).map((d) => join3(parent, d.name));
+  } else {
+    folders = positionals.slice(1).map((f) => resolvePath(process.cwd(), f));
+  }
+  if (!folders.length) fail("unwire requires folder arg(s) or --all <parent>", EXIT.USAGE);
+  const isPostboxHook = (entry) => {
+    const s = JSON.stringify(entry);
+    return s.includes("postbox.mjs") || s.includes("postbox inbox");
+  };
+  let changed = 0;
+  for (const dir of folders) {
+    const name = basename2(dir);
+    const sjPath = join3(dir, ".claude", "settings.json");
+    if (!existsSync3(sjPath)) {
+      process.stdout.write(`  \xB7 ${name} \u2014 no settings.json
+`);
+      continue;
+    }
+    let sj;
+    try {
+      sj = JSON.parse(readFileSync3(sjPath, "utf8"));
+    } catch {
+      process.stdout.write(`  \u2717 ${name} \u2014 settings.json not valid JSON (skipped)
+`);
+      continue;
+    }
+    let removed = 0;
+    for (const ev of WIRE_HOOK_EVENTS) {
+      const arr = sj.hooks?.[ev];
+      if (!Array.isArray(arr)) continue;
+      const kept = arr.filter((entry) => !isPostboxHook(entry));
+      removed += arr.length - kept.length;
+      if (kept.length) sj.hooks[ev] = kept;
+      else delete sj.hooks[ev];
+    }
+    if (sj.hooks && !Object.keys(sj.hooks).length) delete sj.hooks;
+    if (!removed) {
+      process.stdout.write(`  \xB7 ${name} \u2014 no postbox hooks
+`);
+      continue;
+    }
+    changed++;
+    process.stdout.write(`  ${apply ? "\u2713" : "\u2192"} ${name} \u2014 remove ${removed} postbox hook(s)
+`);
+    if (apply) writeFileSync2(sjPath, `${JSON.stringify(sj, null, 2)}
+`);
+  }
+  process.stdout.write(`
+${apply ? "unwired" : "would unwire"} ${changed} folder(s)${apply || !changed ? "" : " \u2014 re-run with --apply"}
+`);
+  return EXIT.OK;
 }
 function tally(rows, key) {
   const m = {};

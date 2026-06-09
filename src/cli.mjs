@@ -48,6 +48,7 @@ Commands:
   doctor   verify atomic rename works on this filesystem
   init     scaffold a .postbox.toml + print the settings.json snippets
   wire     bulk-wire many folders onto one shared mailbox
+  unwire   strip postbox inbox hooks (e.g. when switching to the installed plugin)
   migrate  migrate a legacy flat _briefs/ dir onto the postbox schema
 
 Global options:
@@ -94,6 +95,12 @@ settings.json write-boundary + inbox-hook snippets. Exit codes: 0 ok`,
 
 Dry-run until --apply. Never clobbers an existing .postbox.toml. --with-hooks also merges
 the inbox pointer hook into each folder's .claude/settings.json. Exit codes: 0 ok`,
+  unwire: `postbox unwire <folder...> [--apply]
+       postbox unwire --all <parent> [--exclude a,b] [--apply]
+
+Removes postbox inbox hooks from each folder's .claude/settings.json (inverse of
+wire --with-hooks). Use when switching to the installed plugin, whose own hooks then drive
+surfacing. Leaves .postbox.toml + allow-rules intact. Dry-run until --apply. Exit codes: 0 ok`,
   migrate: `postbox migrate --from <legacy-briefs-dir> [--to <dir>] [--apply]
 
 Dry-run until --apply (idempotent; skips already-migrated files). Never deletes the source.
@@ -148,17 +155,25 @@ function main() {
       if (flags['mark-processed'] && !flags.session) fail('--mark-processed requires --session', EXIT.USAGE);
       const mb = mkMailbox();
       const consumer = buildConsumer(flags, config);
-      const asSource = flags['as-source'] ? String(flags['as-source']) : null;
+      // session + source-role fall back to .postbox.toml, so one generic hook
+      // (`postbox inbox --format pointer`) behaves like a hand-wired per-folder hook:
+      // a consumer dedups against its session, an orchestrator sees its return channel.
+      const sessionFromFlag = flags.session ? String(flags.session) : null;
+      const session = sessionFromFlag ?? config.session;
+      const asSource = (flags['as-source'] ? String(flags['as-source']) : null) ?? config.sourceRole;
+      // mark-processed is explicit on the CLI; auto-on when the session was *derived* from
+      // config, else a session-start hook would re-surface the same envelope every turn.
+      const markProcessed = flags['mark-processed'] || (!sessionFromFlag && !!session);
       if (!consumer && !asSource) {
         process.stderr.write('postbox: no consumer identity configured — set identities in .postbox.toml or pass --identities. Showing nothing.\n');
       }
       const res = mb.inbox({
         consumer,
         asSource,
-        unprocessedFor: flags.session ? String(flags.session) : null,
+        unprocessedFor: session,
       });
-      if (flags.session && flags['mark-processed']) {
-        for (const e of [...res.ready, ...res.done]) mb.markProcessed(String(flags.session), e.id);
+      if (session && markProcessed) {
+        for (const e of [...res.ready, ...res.done]) mb.markProcessed(session, e.id);
       }
       // --json is the universal machine-output flag; --format keeps pointer|json|human.
       const format = flags.json ? 'json' : (flags.format ? String(flags.format) : 'human');
@@ -189,10 +204,12 @@ function main() {
       return init(flags);
     case 'wire':
       return wire(positionals, flags);
+    case 'unwire':
+      return unwire(positionals, flags);
     case 'migrate':
       return migrate(flags);
     default:
-      fail(`unknown command '${cmd ?? ''}'. Try: send | inbox | claim | report | sweep | doctor | init | wire | migrate`, EXIT.USAGE);
+      fail(`unknown command '${cmd ?? ''}'. Try: send | inbox | claim | report | sweep | doctor | init | wire | unwire | migrate`, EXIT.USAGE);
   }
 }
 
@@ -319,6 +336,7 @@ tenant_id    = "default"
 lease_ttl    = "60m"
 target_match = "role"
 identities   = ["product:${name}", "session:${name}"]
+session      = "${name}"   # the generic plugin inbox hook dedups against this
 `;
 
 const WIRE_HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit'];
@@ -368,6 +386,54 @@ function applyWire(p) {
     mkdirSync(dirname(p.sjPath), { recursive: true });
     writeFileSync(p.sjPath, `${JSON.stringify(p.sj, null, 2)}\n`);
   }
+}
+
+// Inverse of `wire --with-hooks`: strip postbox inbox hooks from each folder's
+// .claude/settings.json. Use when switching from hand-wired hooks to the installed plugin
+// (whose own hooks then drive surfacing). Leaves .postbox.toml + allow-rules intact.
+// Dry-run unless --apply. Folder selection mirrors `wire` (--all <parent> or explicit list).
+function unwire(positionals, flags) {
+  const apply = !!flags.apply;
+  let folders;
+  if (flags.all) {
+    const parent = resolvePath(process.cwd(), String(flags.all));
+    const exclude = new Set(String(flags.exclude ?? '').split(',').map((s) => s.trim()).filter(Boolean));
+    folders = readdirSync(parent, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('.') && !exclude.has(d.name))
+      .map((d) => join(parent, d.name));
+  } else {
+    folders = positionals.slice(1).map((f) => resolvePath(process.cwd(), f));
+  }
+  if (!folders.length) fail('unwire requires folder arg(s) or --all <parent>', EXIT.USAGE);
+
+  const isPostboxHook = (entry) => {
+    const s = JSON.stringify(entry);
+    return s.includes('postbox.mjs') || s.includes('postbox inbox');
+  };
+  let changed = 0;
+  for (const dir of folders) {
+    const name = basename(dir);
+    const sjPath = join(dir, '.claude', 'settings.json');
+    if (!existsSync(sjPath)) { process.stdout.write(`  · ${name} — no settings.json\n`); continue; }
+    let sj;
+    try { sj = JSON.parse(readFileSync(sjPath, 'utf8')); }
+    catch { process.stdout.write(`  ✗ ${name} — settings.json not valid JSON (skipped)\n`); continue; }
+    let removed = 0;
+    for (const ev of WIRE_HOOK_EVENTS) {
+      const arr = sj.hooks?.[ev];
+      if (!Array.isArray(arr)) continue;
+      const kept = arr.filter((entry) => !isPostboxHook(entry));
+      removed += arr.length - kept.length;
+      if (kept.length) sj.hooks[ev] = kept; else delete sj.hooks[ev];
+    }
+    if (sj.hooks && !Object.keys(sj.hooks).length) delete sj.hooks;
+    if (!removed) { process.stdout.write(`  · ${name} — no postbox hooks\n`); continue; }
+    changed++;
+    process.stdout.write(`  ${apply ? '✓' : '→'} ${name} — remove ${removed} postbox hook(s)\n`);
+    if (apply) writeFileSync(sjPath, `${JSON.stringify(sj, null, 2)}\n`);
+  }
+  process.stdout.write(`\n${apply ? 'unwired' : 'would unwire'} ${changed} folder(s)${apply || !changed ? '' : ' — re-run with --apply'}\n`);
+  return EXIT.OK;
 }
 
 function tally(rows, key) {
