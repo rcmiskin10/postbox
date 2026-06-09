@@ -1,10 +1,13 @@
 {
-  "name": "postbox",
-  "version": "0.1.1",
+  "name": "@rcmiskin10/postbox",
+  "version": "0.1.2",
   "description": "A mailbox for agent sessions: race-free, server-free task handoff via the Maildir atomic-rename pattern.",
   "type": "module",
   "bin": {
     "postbox": "bin/postbox.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "exports": {
     ".": "./src/index.mjs"

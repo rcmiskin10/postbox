@@ -6,6 +6,17 @@ All notable changes to postbox are documented here. The format follows
 `schema_version` (the envelope wire contract, SPEC §14) is independent of the package version —
 it is currently **1** and has not changed.
 
+## [0.1.2] — 2026-06-06
+
+Packaging-only release. No code, API, or envelope schema change.
+
+### Changed
+- Published to npm under the scoped name **`@rcmiskin10/postbox`** (the unscoped `postbox` name is
+  owned by an unrelated package). The installed CLI command is unchanged — still `postbox` — and
+  the GitHub repo and Claude Code plugin are still named `postbox`. Only the npm package and the
+  `import` specifier carry the scope. Added `publishConfig.access = "public"` so the scoped
+  package publishes publicly.
+
 ## [0.1.1] — 2026-06-05
 
 Bug-fix and documentation release. No envelope schema change; fully backward compatible.
@@ -59,5 +70,6 @@ Initial release: the envelope schema (`schema_version: 1`), the status-in-path s
 return channel, the `postbox` CLI, the Claude Code plugin (commands + surfacing hooks),
 `postbox wire`, and `postbox migrate`.
 
+[0.1.2]: https://github.com/rcmiskin10/postbox/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rcmiskin10/postbox/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rcmiskin10/postbox/releases/tag/v0.1.0
