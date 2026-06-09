@@ -1,10 +1,10 @@
 # Library API
 
 postbox is usable as a zero-config Node library, not just a CLI. The package is published as
-`@rcmiskin10/postbox`; its entry point re-exports everything from `src/`.
+`@rcmisk/postbox`; its entry point re-exports everything from `src/`.
 
 ```js
-import { Mailbox, loadConfig } from '@rcmiskin10/postbox';
+import { Mailbox, loadConfig } from '@rcmisk/postbox';
 ```
 
 All file operations are synchronous (the whole design is a thin layer over `rename(2)`), so the

@@ -1,6 +1,6 @@
 {
-  "name": "@rcmiskin10/postbox",
-  "version": "0.1.2",
+  "name": "@rcmisk/postbox",
+  "version": "0.1.3",
   "description": "A mailbox for agent sessions: race-free, server-free task handoff via the Maildir atomic-rename pattern.",
   "type": "module",
   "bin": {
