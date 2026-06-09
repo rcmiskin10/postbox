@@ -55,17 +55,17 @@ zero-dependency bundle, so there's nothing to `npm install`.
 
 ### As a CLI / library (npm)
 
-Published under the scoped name `@rcmiskin10/postbox` (the unscoped `postbox` is taken). The
+Published under the scoped name `@rcmisk/postbox` (the unscoped `postbox` is taken). The
 installed **command is still `postbox`** — the scope only affects the package/import name.
 
 ```bash
-npm install -g @rcmiskin10/postbox    # installs the `postbox` command
+npm install -g @rcmisk/postbox    # installs the `postbox` command
 # or
-npx @rcmiskin10/postbox doctor        # one-off
+npx @rcmisk/postbox doctor        # one-off
 ```
 
 ```js
-import { Mailbox } from '@rcmiskin10/postbox';   // programmatic use
+import { Mailbox } from '@rcmisk/postbox';   // programmatic use
 ```
 
 *Dev mode* and `--plugin-dir` point at the **repo root** (which contains the
@@ -73,7 +73,7 @@ import { Mailbox } from '@rcmiskin10/postbox';   // programmatic use
 
 ### Library API
 
-`import … from '@rcmiskin10/postbox'` exposes:
+`import … from '@rcmisk/postbox'` exposes:
 
 | export | kind | purpose |
 |---|---|---|
@@ -85,7 +85,7 @@ import { Mailbox } from '@rcmiskin10/postbox';   // programmatic use
 | `loadConfig` / `parseDuration` | fn | resolve `.postbox.toml` for a cwd / parse a `60m`-style duration |
 
 ```js
-import { Mailbox, loadConfig } from '@rcmiskin10/postbox';
+import { Mailbox, loadConfig } from '@rcmisk/postbox';
 const { handoffDir, tenantId, leaseTtlMs } = loadConfig(process.cwd());
 const mb = new Mailbox({ dir: handoffDir, tenantId, leaseTtlMs });
 const env = mb.send({ type: 'brief', target: 'product:foo', sourceRole: 'orchestrator', body: '# do X' });

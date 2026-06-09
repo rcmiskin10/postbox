@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "postbox — a race-free, server-free mailbox for handing work off between agent sessions.",
-    "version": "0.1.2"
+    "version": "0.1.3"
   },
   "plugins": [
     {
