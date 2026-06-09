@@ -6,6 +6,23 @@ All notable changes to postbox are documented here. The format follows
 `schema_version` (the envelope wire contract, SPEC §14) is independent of the package version —
 it is currently **1** and has not changed.
 
+## [Unreleased]
+
+Lets a single generic inbox hook replace per-folder hook wiring — so the installed plugin's
+hooks match a hand-wired setup, with no regression to dedup or the orchestrator return channel.
+Backward compatible; no envelope schema change.
+
+### Added
+- **Config-derived inbox identity.** `inbox` now falls back to `.postbox.toml` for the session
+  (`session` key, or the `session:<name>` identity convention) and source role (`source_role`),
+  and auto-marks-processed when the session is derived. So `postbox inbox --format pointer` with
+  no flags dedups like `--session X --mark-processed` and surfaces an orchestrator's return
+  channel like `--as-source X` — exactly what a generic plugin hook needs.
+- **`postbox unwire`** — inverse of `wire --with-hooks`: strips postbox inbox hooks from each
+  folder's `.claude/settings.json` (for switching from hand-wired hooks to the installed plugin).
+  Dry-run until `--apply`; leaves `.postbox.toml` and allow-rules intact.
+- `wire` now writes an explicit `session` key into each consumer `.postbox.toml`.
+
 ## [0.1.2] — 2026-06-06
 
 Packaging-only release. No code, API, or envelope schema change.
