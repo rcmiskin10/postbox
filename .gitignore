@@ -11,5 +11,12 @@ dist/
 # local config
 .postbox.local.toml
 
+# secrets / credentials — never commit (npm tokens, env files)
+.env
+.env.*
+!.env.example
+.npmrc
+# (a CI .npmrc that only references ${NPM_TOKEN} is safe — force-add with `git add -f .npmrc`)
+
 # local pnpm store (sandbox writable; not for commit)
 .pnpm-store/
